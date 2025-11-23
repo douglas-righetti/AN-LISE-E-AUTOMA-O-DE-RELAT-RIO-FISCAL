@@ -1,0 +1,707 @@
+# ==============================================================================
+# TÍTULO: AUTOMAÇÃO E CONCILIAÇÃO FISCAL (VERSÃO FINAL H - DOCUMENTADA)
+# DESCRIÇÃO: Script para processamento de extratos e notas, auditoria cruzada
+#            e geração de relatório PDF com gráficos gerenciais corrigidos.
+# ==============================================================================
+
+# 1. INSTALAÇÃO E IMPORTAÇÃO DE BIBLIOTECAS
+# ------------------------------------------------------------------------------
+# Instala as bibliotecas necessárias para manipulação de dados, gráficos e PDF.
+!pip install pandas numpy matplotlib reportlab requests openpyxl
+
+import pandas as pd
+import numpy as np
+import io
+import os
+import time
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# Colab helpers (fallback pra local)
+try:
+    from google.colab import files
+    _HAS_COLAB = True
+except Exception:
+    _HAS_COLAB = False
+
+# PDF
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+
+# Requests (opcional para consulta de CNPJ)
+import requests
+# Matplotlib (para formatar gráficos)
+from matplotlib.ticker import FuncFormatter
+
+
+# ---------- CONFIG ----------
+API_TOKEN = "21658|9svRpIVCYW0qmFiQ0SudnecBoHUuowGY"  # use seu token real se quiser consultas
+img_dir = "tmp_graficos" # Diretório para todos os gráficos
+os.makedirs(img_dir, exist_ok=True)
+
+# Mês nomes
+meses_portugues = {
+    1: 'Janeiro', 2: 'Fevereiro', 3: 'Março', 4: 'Abril', 5: 'Maio', 6: 'Junho',
+    7: 'Julho', 8: 'Agosto', 9: 'Setembro', 10: 'Outubro', 11: 'Novembro', 12: 'Dezembro'
+}
+meses_siglas = {
+    1: 'Jan', 2: 'Fev', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun',
+    7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Out', 11: 'Nov', 12: 'Dez'
+}
+
+# ---------- FUNÇÕES ÚTEIS (LIMPEZA / LEITURA / IMPOSTOS) ----------
+
+def limpar_valor(valor_str):
+    if pd.isna(valor_str):
+        return 0.0
+    s = str(valor_str).strip()
+    s = s.replace('\xa0', '')  # non-breaking space
+    s = s.replace('R$', '').replace('r$', '').strip()
+    negative = False
+    if '(' in s and ')' in s:
+        negative = True
+        s = s.replace('(', '').replace(')', '')
+    if '-' in s:
+        negative = True
+        s = s.replace('-', '')
+    s = s.replace('.', '').replace(',', '.').replace(' ', '')
+    try:
+        v = float(s)
+        return -v if negative else v
+    except:
+        return 0.0
+
+def detectar_separador_e_ler(bytes_content):
+    text = bytes_content[:4096].decode('latin1', errors='ignore')
+    if '\t' in text and text.count('\t') > text.count(',') and text.count('\t') > text.count(';'):
+        sep = '\t'
+    elif ';' in text and text.count(';') >= text.count(','):
+        sep = ';'
+    elif ',' in text:
+        sep = ','
+    else:
+        sep = None
+    if sep:
+        return pd.read_csv(io.StringIO(bytes_content.decode('latin1')), sep=sep, dtype=str)
+    else:
+        return pd.read_csv(io.StringIO(bytes_content.decode('latin1')), sep=None, engine='python', dtype=str)
+
+def parse_data_robusta(s):
+    if pd.isna(s):
+        return pd.NaT
+    if isinstance(s, pd.Timestamp):
+        return s
+    str_s = str(s).strip()
+    formatos = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y", "%Y/%m/%d"]
+    for f in formatos:
+        try:
+            return pd.to_datetime(str_s, format=f)
+        except:
+            continue
+    try:
+        return pd.to_datetime(str_s, dayfirst=True, errors='coerce')
+    except:
+        return pd.NaT
+
+def calcular_simples_nacional_anexo3(faturamento_anual):
+    tabelas = [
+        (180000, 0.06, 0),
+        (360000, 0.112, 9360),
+        (720000, 0.135, 17640),
+        (1800000, 0.175, 35640),
+        (3600000, 0.21, 125640),
+        (4800000, 0.33, 648000)
+    ]
+    for limite, aliquota, parcela_deduzir in tabelas:
+        if faturamento_anual <= limite:
+            return max((faturamento_anual * aliquota) - parcela_deduzir, 0)
+    return faturamento_anual * 0.33
+
+# --- ESSA FOI A FUNÇÃO QUE EU INSERI POIS ESTAVA FALTANDO ---
+def verificar_mudanca_faixa(faturamento_anual):
+    faixas = [180000, 360000, 720000, 1800000, 3600000, 4800000]
+    for limite in faixas:
+        if faturamento_anual < limite:
+            restante = limite - faturamento_anual
+            if restante <= limite * 0.1:
+                return f'<font color="red">■ [ATENÇÃO]: PRÓXIMO DE MUDANÇA DE FAIXA. Restante: {formatar_moeda(restante)}</font>'
+            break
+    return '<font color="green">■ [OK]: Faturamento dentro da faixa atual.</font>'
+# ------------------------------------------------------------
+
+def verificar_status_cnpj(cnpj, max_retries=2):
+    cnpj_limpo = ''.join(filter(str.isdigit, str(cnpj)))
+    if not cnpj_limpo:
+        return "DESCONHECIDO"
+    url = f"https://api.invertexto.com/v1/cnpj/{cnpj_limpo}?token={API_TOKEN}"
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("situacao", {}).get("nome") or "DESCONHECIDO"
+            elif resp.status_code == 401:
+                return "TOKEN INVÁLIDO"
+            elif resp.status_code == 404:
+                return "NÃO ENCONTRADO"
+            else:
+                resp.raise_for_status()
+        except requests.exceptions.RequestException:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            else:
+                return "ERRO NA CONSULTA"
+
+def formatar_moeda(valor):
+    if pd.isna(valor):
+        return "R$ 0,00"
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def formatador_moeda_grafico(x, pos):
+    if x == 0:
+        return "R$ 0"
+    if abs(x) >= 1_000_000:
+        return f"R$ {x/1_000_000:,.1f}M".replace(",", ".")
+    if abs(x) >= 1_000:
+        return f"R$ {x/1_000:,.0f}k".replace(",", ".")
+    return f"R$ {x:,.0f}"
+
+# ---------- UPLOAD / LEITURA (COLAB ou LOCAL) ----------
+print("Selecione os arquivos: notas_fiscais e extrato_bancario")
+uploaded = {}
+if _HAS_COLAB:
+    uploaded = files.upload()
+else:
+    for fname in os.listdir('.'):
+        if any(x in fname.lower() for x in ['notas', 'extrato']):
+            with open(fname, 'rb') as f:
+                uploaded[fname] = f.read()
+
+if len(uploaded) == 0:
+    raise SystemExit("Nenhum arquivo encontrado. Faça upload ou coloque os arquivos no diretório atual.")
+
+# tenta identificar os dois arquivos
+extrato_key = None
+notas_key = None
+for k in uploaded.keys():
+    kl = k.lower()
+    if 'extrato' in kl and extrato_key is None:
+        extrato_key = k
+    if 'nota' in kl or 'notas' in kl:
+        notas_key = k
+
+if not extrato_key or not notas_key:
+    for k in uploaded.keys():
+        snippet = uploaded[k][:2048].decode('latin1', errors='ignore').lower()
+        if ('cnpj' in snippet or 'valor' in snippet) and ('nf' in snippet or 'serie' in snippet or 'nota' in snippet):
+            notas_key = notas_key or k
+        elif ('descricao' in snippet or 'saldo' in snippet or 'valor' in snippet):
+            extrato_key = extrato_key or k
+
+if not extrato_key or not notas_key:
+    raise SystemExit("Não foi possível identificar arquivos 'extrato' e 'notas'. Nomeie-os contendo 'extrato' e 'notas'.")
+
+print("Arquivo extrato:", extrato_key)
+print("Arquivo notas:", notas_key)
+
+# leitura tolerante
+try:
+    df_extrato = detectar_separador_e_ler(uploaded[extrato_key])
+except Exception as e:
+    raise SystemExit(f"Erro ao ler extrato: {e}")
+
+try:
+    df_notas = detectar_separador_e_ler(uploaded[notas_key])
+except Exception as e:
+    raise SystemExit(f"Erro ao ler notas: {e}")
+
+# ---------- NORMALIZAÇÃO DE NOMES DE COLUNA (tolerante) ----------
+def encontrar_e_renomear_coluna(df, keywords):
+    for col in df.columns:
+        col_limpa = col.lower()
+        for k in keywords:
+            if k in col_limpa:
+                return col
+    return None
+
+# Extrato
+col_data_extrato = encontrar_e_renomear_coluna(df_extrato, ['data', 'dt', 'lancamento'])
+col_desc_extrato = encontrar_e_renomear_coluna(df_extrato, ['descr', 'hist', 'descricao', 'historico'])
+col_valor_extrato = encontrar_e_renomear_coluna(df_extrato, ['valor', 'amount', 'valor (bruto)'])
+if col_data_extrato: df_extrato.rename(columns={col_data_extrato: 'Data'}, inplace=True)
+if col_desc_extrato: df_extrato.rename(columns={col_desc_extrato: 'Descricao'}, inplace=True)
+if col_valor_extrato: df_extrato.rename(columns={col_valor_extrato: 'Valor'}, inplace=True)
+
+# Notas
+col_data_notas = encontrar_e_renomear_coluna(df_notas, ['data', 'emissao', 'dt'])
+col_cnpj_notas = encontrar_e_renomear_coluna(df_notas, ['cnpj', 'cpf'])
+col_valor_notas = encontrar_e_renomear_coluna(df_notas, ['valor', 'total', 'venda'])
+col_numero_notas = encontrar_e_renomear_coluna(df_notas, ['numero', 'nf', 'serie'])
+if col_data_notas: df_notas.rename(columns={col_data_notas: 'Data'}, inplace=True)
+if col_cnpj_notas: df_notas.rename(columns={col_cnpj_notas: 'CNPJCliente'}, inplace=True)
+if col_valor_notas: df_notas.rename(columns={col_valor_notas: 'Valor'}, inplace=True)
+if col_numero_notas: df_notas.rename(columns={col_numero_notas: 'Numero'}, inplace=True)
+
+# garantir colunas mínimas
+if 'Valor' not in df_extrato.columns: raise SystemExit("Coluna 'Valor' não encontrada no extrato.")
+if 'Data' not in df_extrato.columns: raise SystemExit("Coluna 'Data' não encontrada no extrato.")
+if 'Valor' not in df_notas.columns: raise SystemExit("Coluna 'Valor' não encontrada nas notas.")
+if 'Data' not in df_notas.columns: raise SystemExit("Coluna 'Data' não encontrada nas notas.")
+if 'CNPJCliente' not in df_notas.columns: df_notas['CNPJCliente'] = ''
+if 'Descricao' not in df_extrato.columns: df_extrato['Descricao'] = 'Sem descrição'
+
+
+# ---------- LIMPEZA E CONVERSÃO ----------
+df_extrato['Valor_Num'] = df_extrato['Valor'].apply(limpar_valor)
+df_extrato['Data'] = df_extrato['Data'].apply(parse_data_robusta)
+df_extrato = df_extrato.dropna(subset=['Data']).copy()
+df_extrato['Mes'] = df_extrato['Data'].dt.to_period('M')
+df_extrato['Ano'] = df_extrato['Data'].dt.year
+
+df_notas['Valor'] = df_notas['Valor'].apply(limpar_valor)
+df_notas['Data'] = df_notas['Data'].apply(parse_data_robusta)
+df_notas = df_notas.dropna(subset=['Data']).copy()
+df_notas['Mes'] = df_notas['Data'].dt.to_period('M')
+df_notas['Ano'] = df_notas['Data'].dt.year
+
+# ---------- CALCULOS MENSAL/ANUAL PARA INSERÇÃO (FUNDIR) ----------
+periodos = sorted(list(set(list(df_notas['Mes'].unique()) + list(df_extrato['Mes'].unique()))))
+faturamento_por_ano = df_notas.groupby(df_notas['Data'].dt.year)['Valor'].sum().to_dict()
+
+resumo_financeiro_mensal = []
+lista_despesas_raw = []
+impostos_mensais = {}
+
+# *** NOVAS Listas para Auditoria Global ***
+todas_as_notas = df_notas.copy()
+todos_recebimentos = df_extrato[df_extrato['Valor_Num'] > 0].copy()
+
+
+# ---------- MONTAR PDF (MES A MES) ----------
+
+styles = getSampleStyleSheet()
+normal_style = styles['Normal']
+heading1_style = styles['Heading1']
+heading2_style = styles['Heading2']
+heading3_style = styles['Heading3']
+
+story = []
+story.append(Paragraph("Relatório de Análise Fiscal e Financeira", heading1_style))
+story.append(Spacer(1, 0.2*inch))
+
+is_first = True
+for per in periodos:
+    ano = int(per.year)
+    mes = int(per.month)
+
+    if not is_first:
+        story.append(PageBreak())
+    is_first = False
+
+    story.append(Paragraph(f"Análise do Mês: {meses_portugues.get(mes, mes)}/{ano}", heading2_style))
+    story.append(Spacer(1, 0.1*inch))
+
+    # Filtra mês
+    notas_mes = df_notas[df_notas['Mes'] == per].copy()
+    extrato_mes = df_extrato[df_extrato['Mes'] == per].copy()
+
+    # ----- CALCULOS REFINADOS (FUNDIR AQUI) -----
+    faturamento_fiscal = notas_mes['Valor'].sum()
+    entradas_caixa = extrato_mes[extrato_mes['Valor_Num'] > 0]['Valor_Num'].sum()
+    saidas_caixa_raw = extrato_mes[extrato_mes['Valor_Num'] < 0]['Valor_Num'].sum()  # negativo
+    saidas_caixa_pos = abs(saidas_caixa_raw)
+    saldo_mes = entradas_caixa - saidas_caixa_pos  # Entradas - Saídas (mais intuitivo)
+
+    # Imposto estimado (base anual)
+    faturamento_anual = faturamento_por_ano.get(ano, df_notas[df_notas['Data'].dt.year == ano]['Valor'].sum())
+    imposto_estimado = calcular_simples_nacional_anexo3(faturamento_anual)
+    impostos_mensais[(ano, mes)] = imposto_estimado
+
+    # --- INSERIR SEÇÕES (MANTER ORDEM DO RELATÓRIO) ---
+    # 1) Faturamento e imposto (Notas)
+    story.append(Paragraph(f"Faturamento Total do Mês: <b>{formatar_moeda(faturamento_fiscal)}</b>", normal_style))
+    story.append(Paragraph(f"Estimativa de Imposto (Simples Nacional): <b>{formatar_moeda(imposto_estimado)}</b>", normal_style))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # 2) Controle Financeiro (Extrato) - (Movido para cima para agrupar)
+    story.append(Paragraph("Controle Financeiro do Mês (Fluxo de Caixa)", heading3_style))
+    cor_saldo = 'green' if saldo_mes >= 0 else 'red'
+    story.append(Paragraph(f"Total de Entradas (Extrato): <b><font color='green'>{formatar_moeda(entradas_caixa)}</font></b>", normal_style))
+    story.append(Paragraph(f"Total de Saídas (Extrato): <b><font color='red'>{formatar_moeda(saidas_caixa_raw)}</font></b>", normal_style))
+    story.append(Paragraph(f"Saldo do Mês (Caixa): <b><font color='{cor_saldo}'>{formatar_moeda(saldo_mes)}</font></b>", normal_style))
+    story.append(Spacer(1, 0.2*inch))
+
+
+    # ------------------ APERFEIÇOAMENTO: Gráfico mensal RE-ADICIONADO (com MARGEM CORRIGIDA) ------------------
+    try:
+        fig, ax = plt.subplots(figsize=(6, 2.5)) # Tamanho pequeno
+        
+        labels = ['Faturamento (NFs)', 'Entradas (Extrato)', 'Saídas (Extrato)']
+        values = [float(faturamento_fiscal), float(entradas_caixa), float(saidas_caixa_pos)]
+        x_pos = np.arange(len(labels))
+        
+        # Barras mais finas (width=0.6)
+        bars = ax.bar(x_pos, values, width=0.6, color=['#2E86AB', '#4CAF50', '#F44336'], zorder=2)
+        
+        # *** CORREÇÃO DA MARGEM (Y-LIMIT) ***
+        # Define o "ar" em cima do gráfico
+        maxv = max(values) if values else 0
+        ax.set_ylim(bottom=0, top=maxv * 1.15 if maxv > 0 else 100) # 15% de "ar"
+        # *** FIM DA CORREÇÃO ***
+        
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(labels, rotation=10, ha='right', fontsize=8) # Rótulos levemente girados
+        ax.set_ylabel("R$", fontsize=8)
+        ax.set_title(f"Resumo Mensal - {meses_portugues.get(mes)}/{ano}", fontsize=10, pad=15)
+        ax.yaxis.set_major_formatter(FuncFormatter(formatador_moeda_grafico))
+        ax.grid(True, axis='y', linestyle=':', alpha=0.6)
+
+        # Rótulos "inteligentes" (ex: "R$ 45k") para não sobrepor
+        for bar in bars:
+            yval = bar.get_height()
+            if yval > 0:
+                ax.annotate(formatador_moeda_grafico(yval, None),
+                            xy=(bar.get_x() + bar.get_width() / 2, yval),
+                            xytext=(0, 3), # 3 pontos de offset vertical
+                            textcoords="offset points",
+                            ha='center', va='bottom',
+                            fontsize=8, fontweight='bold')
+
+        plt.tight_layout()
+        img_path = os.path.join(img_dir, f"graf_mensal_{ano}_{mes}.png") # Nome de arquivo único
+        plt.savefig(img_path)
+        plt.close(fig)
+
+        # Inserir imagem no PDF
+        story.append(Paragraph("Gráfico Resumo Mensal:", heading3_style))
+        story.append(Spacer(1, 0.05*inch))
+        story.append(Image(img_path, width=6*inch, height=2.5*inch, hAlign='CENTER'))
+        story.append(Spacer(1, 0.1*inch))
+    
+    except Exception as e:
+        story.append(Paragraph(f"<font color='red'>Erro ao gerar gráfico do mês: {e}</font>", normal_style))
+    # ---------------------------------------------------------------------------------
+
+
+    # armazenar para resumo anual / gráficos agregados
+    resumo_financeiro_mensal.append({
+        'Ano': ano,
+        'Mes': mes,
+        'Entradas_Caixa': entradas_caixa,
+        'Saidas_Caixa': saidas_caixa_raw,  # negativo
+        'Saidas_Caixa_Pos': saidas_caixa_pos,
+        'Saldo_Mes': saldo_mes,
+        'Faturamento_NFs': faturamento_fiscal
+    })
+
+    # guardar despesas para top10
+    despesas_do_mes = extrato_mes[extrato_mes['Valor_Num'] < 0]
+    if not despesas_do_mes.empty:
+        lista_despesas_raw.append(despesas_do_mes[['Descricao', 'Valor_Num']].rename(columns={'Valor_Num':'Valor'}))
+
+    # ------------------ Alertas de inconsistência (JANELA CORRIGIDA) ------------------
+    story.append(Paragraph("Alertas de Inconsistência (Auditoria Fiscal)", heading3_style))
+    extrato_recebimentos_mes = extrato_mes[extrato_mes['Valor_Num'] > 0] # Apenas recebimentos deste mês
+
+    # --- Alerta 1: Notas Fiscais emitidas ESTE MÊS sem recebimento correspondente (Janela de 35 dias) ---
+    notas_sem_corresp = []
+    for _, nota in notas_mes.iterrows():
+        # Procura por um recebimento no extrato (GLOBAL) com mesmo valor e data próxima
+        data_inicio_busca = nota['Data']
+        data_fim_busca = nota['Data'] + pd.Timedelta(days=35) # *** JANELA CORRIGIDA ***
+        
+        janela = (todos_recebimentos['Data'] >= data_inicio_busca) & (todos_recebimentos['Data'] <= data_fim_busca)
+        match = todos_recebimentos[janela & (np.isclose(todos_recebimentos['Valor_Num'], nota['Valor'], atol=0.01))]
+        
+        if match.empty:
+            notas_sem_corresp.append(nota)
+
+    if notas_sem_corresp:
+        story.append(Paragraph('<font color="orange">■</font> [ATENÇÃO]: Notas Fiscais emitidas este mês sem recebimento (em até 35 dias):', normal_style))
+        for nota in notas_sem_corresp:
+            story.append(Paragraph(f"  - Nota de {formatar_moeda(nota['Valor'])} de {nota['Data'].strftime('%d/%m/%Y')} (CNPJ: {nota.get('CNPJCliente','')}).", normal_style))
+    else:
+        story.append(Paragraph('<font color="green">■</font> [OK]: Todas as notas do mês parecem ter recebimento (em até 35 dias).', normal_style))
+    story.append(Spacer(1, 0.1*inch))
+
+    # --- Alerta 2: Recebimentos no Extrato DESTE MÊS sem Nota Fiscal (Janela de 35 dias) ---
+    recebimentos_sem_nota = []
+    for _, receb in extrato_recebimentos_mes.iterrows():
+        # Procura por uma nota fiscal (GLOBAL) com mesmo valor e data próxima
+        data_fim_busca = receb['Data']
+        data_inicio_busca = receb['Data'] - pd.Timedelta(days=35) # *** JANELA CORRIGIDA ***
+
+        janela = (todas_as_notas['Data'] <= data_fim_busca) & (todas_as_notas['Data'] >= data_inicio_busca)
+        match = todas_as_notas[janela & (np.isclose(todas_as_notas['Valor'], receb['Valor_Num'], atol=0.01))]
+        
+        if match.empty:
+            recebimentos_sem_nota.append(receb)
+
+    if recebimentos_sem_nota:
+        story.append(Paragraph('<font color="red">■</font> [RISCO DE OMISSÃO]: Recebimentos no extrato sem Nota Fiscal (em 35 dias):', normal_style))
+        for receb in recebimentos_sem_nota:
+            story.append(Paragraph(f"  - Recebimento de {formatar_moeda(receb['Valor_Num'])} em {receb['Data'].strftime('%d/%m/%Y')} (Desc: {receb.get('Descricao','')}).", normal_style))
+    else:
+        story.append(Paragraph('<font color="green">■</font> [OK]: Todos os recebimentos do mês têm NFs correspondentes (em 35 dias).', normal_style))
+    story.append(Spacer(1, 0.2*inch))
+
+
+    # Lista de Notas e Movimentações (mantive como no seu padrão)
+    story.append(Paragraph("Detalhes do Mês", heading3_style))
+    story.append(Paragraph("Notas Fiscais Emitidas:", normal_style))
+    if not notas_mes.empty:
+        for _, row in notas_mes.iterrows():
+            story.append(Paragraph(f"• Data: {row['Data'].strftime('%d/%m/%Y')}, CNPJ: {row.get('CNPJCliente','')}, Valor: {formatar_moeda(row['Valor'])}", normal_style))
+    else:
+        story.append(Paragraph("Nenhuma nota fiscal emitida neste mês.", normal_style))
+    story.append(Spacer(1, 0.1*inch))
+
+    story.append(Paragraph("Movimentações do Extrato Bancário:", normal_style))
+    if not extrato_mes.empty:
+        for _, row in extrato_mes.iterrows():
+            cor_val = 'green' if row['Valor_Num'] >= 0 else 'black'
+            story.append(Paragraph(f"• Data: {row['Data'].strftime('%d/%m/%Y')}, Descrição: {row.get('Descricao','')}, Valor: <font color='{cor_val}'>{formatar_moeda(row['Valor_Num'])}</font>", normal_style))
+    else:
+        story.append(Paragraph("Nenhuma movimentação no extrato neste mês.", normal_style))
+    story.append(Spacer(1, 0.2*inch))
+
+# ---------- RESUMO ANUAL ----------
+
+story.append(PageBreak())
+story.append(Paragraph("Resumo Anual", heading2_style))
+story.append(Spacer(1, 0.1*inch))
+
+faturamento_anual = df_notas.groupby(df_notas['Data'].dt.year)['Valor'].sum()
+imposto_anual_total = sum(impostos_mensais.values())
+
+if not faturamento_anual.empty:
+    story.append(Paragraph("Faturamento Anual (Notas):", heading3_style))
+    for ano, valor in faturamento_anual.items():
+        story.append(Paragraph(f"  - <b>{int(ano)}</b>: {formatar_moeda(valor)}", normal_style))
+        story.append(Paragraph((verificar_mudanca_faixa(valor)), normal_style))
+else:
+    story.append(Paragraph('<font color="red">■</font> [ERRO]: Não há dados de faturamento anual.', normal_style))
+story.append(Spacer(1, 0.2*inch))
+story.append(Paragraph(f"Estimativa de Imposto Anual (Simples Nacional): <b>{formatar_moeda(imposto_anual_total)}</b>", normal_style))
+story.append(Spacer(1, 0.2*inch))
+
+# ---------- ANALISE DE CNPJs (mantida) ----------
+story.append(Paragraph("Análise de CNPJs em Tempo Real", heading2_style))
+if 'CNPJCliente' in df_notas.columns and not df_notas['CNPJCliente'].empty:
+    for cnpj in df_notas['CNPJCliente'].unique():
+        if pd.isna(cnpj): continue
+        status = verificar_status_cnpj(cnpj)
+        simbolo = {
+            'ATIVA': '<font color="green">■</font>',
+            'BAIXADA': '<font color="black">■</font>',
+            'INAPTA': '<font color="orange">■</font>',
+            'TOKEN INVÁLIDO': '<font color="red">■</font>',
+            'NÃO ENCONTRADO': '<font color="red">■</font>',
+            'ERRO NA CONSULTA': '<font color="red">■</font>',
+            'DESCONHECIDO': '<font color="orange">■</font>'
+        }.get(status.upper() if isinstance(status,str) else str(status), '<font color="black">■</font>')
+        story.append(Paragraph(f"{simbolo} {cnpj} - SITUAÇÃO: {status}", normal_style))
+else:
+    story.append(Paragraph("[INFO]: Nenhuma coluna 'CNPJCliente' encontrada ou vazia.", normal_style))
+story.append(Spacer(1, 0.2*inch))
+
+# ---------- ANÁLISE DE GESTÃO FINANCEIRA (Fluxo anual, Tabelas e Gráficos) ----------
+story.append(PageBreak())
+story.append(Paragraph("Análise de Gestão Financeira (Extrato)", heading2_style))
+story.append(Spacer(1, 0.1*inch))
+
+df_financeiro = pd.DataFrame(resumo_financeiro_mensal)
+df_despesas_total = pd.concat(lista_despesas_raw) if lista_despesas_raw else pd.DataFrame(columns=['Descricao', 'Valor'])
+
+# KPI anual
+if not df_financeiro.empty:
+    total_entradas_ano = df_financeiro['Entradas_Caixa'].sum()
+    total_saidas_ano = df_financeiro['Saidas_Caixa'].sum()
+    total_saldo_ano = df_financeiro['Saldo_Mes'].sum()
+    cor_saldo_ano = 'green' if total_saldo_ano >= 0 else 'red'
+
+    story.append(Paragraph(f"Total de Entradas (Extrato): <b><font color='green'>{formatar_moeda(total_entradas_ano)}</font></b>", normal_style))
+    story.append(Paragraph(f"Total de Saídas (Extrato): <b><font color='red'>{formatar_moeda(total_saidas_ano)}</font></b>", normal_style))
+    story.append(Paragraph(f"Saldo Líquido Anual (Caixa): <b><font color='{cor_saldo_ano}'>{formatar_moeda(total_saldo_ano)}</font></b>", normal_style))
+else:
+    story.append(Paragraph("[INFO]: Nenhum dado financeiro processado para o resumo anual.", normal_style))
+story.append(Spacer(1, 0.2*inch))
+
+# Tabela de Fluxo Mensal
+story.append(Paragraph("Fluxo de Caixa Mensal Detalhado (Extrato)", heading3_style))
+if not df_financeiro.empty:
+    tabela_dados = [['Mês/Ano', 'Entradas', 'Saídas', 'Saldo do Mês']]
+    for _, row in df_financeiro.iterrows():
+        tabela_dados.append([
+            f"{meses_siglas[int(row['Mes'])]}/{int(row['Ano'])}",
+            formatar_moeda(row['Entradas_Caixa']),
+            formatar_moeda(row['Saidas_Caixa_Pos']), # Usando o valor positivo (abs)
+            formatar_moeda(row['Saldo_Mes'])
+        ])
+    t = Table(tabela_dados, colWidths=[1.5*inch, 2.0*inch, 2.0*inch, 2.0*inch])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 8),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+        ('ALIGN', (1,1), (-1,-1), 'RIGHT'),
+    ]))
+    story.append(t)
+else:
+    story.append(Paragraph("[INFO]: Nenhum dado financeiro processado para a tabela mensal.", normal_style))
+story.append(Spacer(1, 0.2*inch))
+
+# --- GRÁFICOS ANUAIS "CLÁSSICOS E LIMPOS" (APERFEIÇOADO) ---
+# Esta função substitui a 'gerar_graficos_anuais' original
+# para usar os gráficos que já aprovamos.
+
+def gerar_graficos_finais_limpos(df_fin, df_despesas):
+    """
+    Gera os 3 gráficos "clássicos e limpos" que aprovamos:
+    1. Barras A vs B
+    2. Linha Saldo Mensal
+    3. Top 10 Despesas
+    """
+    paths = []
+    formatter = FuncFormatter(formatador_moeda_grafico)
+    
+    # Prepara o DataFrame
+    if df_fin.empty:
+        print("DataFrame financeiro vazio, pulando gráficos anuais.")
+        return []
+        
+    df_fin['MesAno'] = df_fin.apply(lambda r: f"{meses_siglas[int(r['Mes'])]}/{int(r['Ano'])}", axis=1)
+    x = np.arange(len(df_fin))
+    width = 0.35
+
+    # --- Gráfico 1: Componentes do Caixa (Entrada vs. Saída) ---
+    try:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        barras_entradas = ax.bar(x - width/2, df_fin['Entradas_Caixa'], 
+                                 width, label='Entradas Reais (A)', color='#4CAF50', zorder=2)
+        barras_saidas = ax.bar(x + width/2, df_fin['Saidas_Caixa_Pos'], 
+                               width, label='Saídas Reais (B)', color='#F44336', zorder=2)
+
+        ax.set_ylabel('Valor (R$)', color='black', fontsize=10)
+        ax.set_title('Gráfico Anual: Componentes do Caixa (Entradas vs. Saídas)', fontsize=14, pad=15)
+        ax.set_xticks(x)
+        ax.set_xticklabels(df_fin['MesAno'], rotation=45)
+        ax.grid(True, axis='y', linestyle=':', alpha=0.7)
+        ax.legend(loc='upper left')
+        ax.yaxis.set_major_formatter(formatter)
+
+        def autolabel_corrigido(barras, ax):
+             for barra in barras:
+                yval = barra.get_height()
+                if yval > 1000: # Não poluir o gráfico com valores pequenos
+                    ax.annotate(f'{formatador_moeda_grafico(yval, None)}',
+                                xy=(barra.get_x() + barra.get_width()/2.0, yval),
+                                xytext=(0, 5), textcoords="offset points",
+                                ha='center', va='bottom',
+                                fontweight='bold', fontsize=7)
+
+        # (Rótulos desativados para um gráfico mais limpo. Descomente para ativar)
+        # autolabel_corrigido(barras_entradas, ax)
+        # autolabel_corrigido(barras_saidas, ax)
+
+        fig.tight_layout()
+        p1 = os.path.join(img_dir, 'graf_fluxo_anual_aprovado.png')
+        plt.savefig(p1); plt.close(fig)
+        paths.append(p1)
+    except Exception as e:
+        print(f"Erro ao gerar Gráfico 1 (Fluxo): {e}")
+
+    # --- Gráfico 2: Evolução do Resultado Líquido (Saldo) ---
+    try:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(df_fin['MesAno'], df_fin['Saldo_Mes'], 
+                label='Saldo do Mês (A-B)', 
+                color='#0D47A1', marker='o', linewidth=3)
+        ax.axhline(0, color='black', linewidth=1.0, linestyle='--')
+        
+        ax.set_ylabel('Saldo Final (R$)', color='black', fontsize=10)
+        ax.set_title('Gráfico Anual: Evolução do Saldo Mensal (A-B)', fontsize=14, pad=15)
+        ax.set_xticks(x)
+        ax.set_xticklabels(df_fin['MesAno'], rotation=45)
+        ax.grid(True, axis='y', linestyle=':', alpha=0.7)
+        ax.yaxis.set_major_formatter(formatter)
+        
+        for i, v in enumerate(df_fin['Saldo_Mes']):
+            ax.text(i, v, f' {formatador_moeda_grafico(v, None)}', 
+                    ha='left', va='bottom' if v > 0 else 'top',
+                    fontweight='bold', fontsize=8)
+        
+        fig.tight_layout()
+        p2 = os.path.join(img_dir, 'graf_saldo_anual_aprovado.png')
+        plt.savefig(p2); plt.close(fig)
+        paths.append(p2)
+    except Exception as e:
+        print(f"Erro ao gerar Gráfico 2 (Saldo): {e}")
+
+    # --- Gráfico 3: Top 10 Despesas ---
+    try:
+        if not df_despesas.empty:
+            # Garante que Descricao seja string para evitar erros no groupby
+            df_despesas['Descricao'] = df_despesas['Descricao'].astype(str)
+            top = df_despesas.groupby('Descricao')['Valor'].sum().abs().nlargest(10).sort_values()
+            
+            if not top.empty:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                top.plot(kind='barh', ax=ax, color='#F44336')
+                ax.set_title("Gráfico Anual: Top 10 Despesas por Descrição")
+                ax.xaxis.set_major_formatter(formatter)
+                ax.set_xlabel('Valor Gasto (R$)')
+                ax.set_ylabel('Descrição')
+                fig.tight_layout()
+                p3 = os.path.join(img_dir, 'graf_top_despesas.png')
+                plt.savefig(p3); plt.close(fig)
+                paths.append(p3)
+            else:
+                print("Gráfico Top 10 Despesas pulado (sem dados de despesa agregados).")
+    except Exception as e:
+        print(f"Erro ao gerar Gráfico 3 (Top Despesas): {e}")
+
+    return paths
+# --- FIM DA FUNÇÃO DE GRÁFICOS APERFEIÇOADA ---
+
+
+# *** APERFEIÇOAMENTO: Chamando a função de gráfico correta ***
+paths_anuais = gerar_graficos_finais_limpos(df_financeiro, df_despesas_total)
+
+# inserir gráficos no PDF
+if paths_anuais:
+    for p in paths_anuais:
+        # Tenta adicionar o gráfico, se falhar, informa no PDF
+        try:
+            story.append(PageBreak())
+            story.append(Image(p, width=7*inch, height=4.5*inch, hAlign='CENTER'))
+            story.append(Spacer(1, 0.2*inch))
+        except Exception as e:
+            print(f"Erro ao tentar embutir imagem {p} no PDF: {e}")
+            story.append(Paragraph(f"<font color='red'>Erro ao carregar imagem {p}: {e}</font>", normal_style))
+else:
+    print("Nenhum gráfico anual foi gerado.")
+
+# ---------- GERAR PDF FINAL ----------
+pdf_name = "relatorio_fiscal_integrado_APERFEICOADO.pdf"
+doc = SimpleDocTemplate(pdf_name, pagesize=letter)
+doc.build(story)
+print("PDF gerado:", pdf_name)
+
+if _HAS_COLAB:
+    files.download(pdf_name)
+
+# Limpar imagens temporárias (opcional)
+for f in os.listdir(img_dir):
+    try:
+        os.remove(os.path.join(img_dir, f))
+    except:
+        pass
+
+print("Processamento concluído com sucesso.")
